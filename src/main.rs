@@ -1,7 +1,12 @@
 #![feature(try_blocks)]
 
+use anyhow::anyhow;
+use clap::Parser;
 use shadertoy_wgpu::{Fps, State};
 use std::env;
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Arc;
 use wgpu::{Backends, Instance, InstanceDescriptor, InstanceFlags};
 use winit::application::ApplicationHandler;
@@ -13,16 +18,22 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
 };
 
+struct Config {
+    code: String,
+}
+
 #[derive(Default)]
 struct App {
     pub state: Option<State>,
     pub window: Option<Arc<Window>>,
     pub fps: Option<Fps>,
     pub frame_counter: usize,
+    pub config: Option<Config>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let config = self.config.as_ref().expect("Config is missing");
         // Create window object
         let window = Arc::new(
             event_loop
@@ -44,7 +55,8 @@ impl ApplicationHandler for App {
                     backend_options: Default::default(),
                 });
                 let surface = instance.create_surface(Arc::clone(&window))?;
-                let state = State::new(instance, surface, (size.width, size.height)).await;
+                let state =
+                    State::new(instance, surface, (size.width, size.height), &config.code).await;
                 self.state = Some(state);
             };
             result
@@ -101,16 +113,37 @@ impl ApplicationHandler for App {
     }
 }
 
-pub fn main() {
+#[derive(Parser, Default)]
+struct Args {
+    /// Shadertoy fragment shader code
+    #[arg(value_hint = clap::ValueHint::FilePath, default_value = "shadertoy.frag")]
+    code: PathBuf,
+}
+
+pub fn main() -> anyhow::Result<()> {
     unsafe {
         env::set_var("RUST_LOG", "info");
     }
     env_logger::init();
 
-    let event_loop = EventLoop::new().unwrap();
+    let args = Args::parse();
+    if !args.code.exists() {
+        return Err(anyhow!(
+            "Shadertoy shader file '{}' does not exist.",
+            args.code.display()
+        ));
+    }
+    let mut shadertoy_code = String::new();
+    File::open(args.code)?.read_to_string(&mut shadertoy_code)?;
 
+    let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::default();
-    event_loop.run_app(&mut app).unwrap();
+    app.config = Some(Config {
+        code: shadertoy_code,
+    });
+    event_loop.run_app(&mut app)?;
+
+    Ok(())
 }

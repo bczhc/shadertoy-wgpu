@@ -1,8 +1,10 @@
 use bytemuck::{bytes_of, Pod, Zeroable};
-use std::fs::File;
-use std::io::Read;
 use std::time::{Duration, Instant};
-use wgpu::{include_wgsl, Buffer, BufferDescriptor, BufferUsages, Device, Instance, LoadOpDontCare, PipelineCompilationOptions, ShaderModuleDescriptor, ShaderSource, Surface, TextureFormat};
+use wgpu::{
+    include_wgsl, Buffer, BufferDescriptor, BufferUsages, Device, Instance,
+    LoadOpDontCare, PipelineCompilationOptions, ShaderModuleDescriptor, ShaderSource, Surface,
+    TextureFormat,
+};
 
 macro_rules! default {
     () => {
@@ -58,7 +60,12 @@ impl State {
         self.surface.configure(&self.device, &surface_config);
     }
 
-    pub async fn new(instance: Instance, surface: Surface<'static>, size: (u32, u32)) -> Self {
+    pub async fn new(
+        instance: Instance,
+        surface: Surface<'static>,
+        size: (u32, u32),
+        code: &str,
+    ) -> Self {
         let adapter = instance.request_adapter(&default!()).await.unwrap();
 
         let (device, queue) = adapter
@@ -75,11 +82,7 @@ impl State {
             texture_format = surface_caps.formats[0].remove_srgb_suffix();
         }
 
-        let mut shadertoy_code = String::new();
-        File::open("shadertoy.frag")
-            .unwrap()
-            .read_to_string(&mut shadertoy_code)
-            .unwrap();
+        let shadertoy_code = code;
         let shader_fs = device.create_shader_module(ShaderModuleDescriptor {
             label: None,
             source: parse_shadertoy_code(&shadertoy_code).unwrap(),
@@ -138,7 +141,7 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: i_frame_buffer.as_entire_binding(),
-                }
+                },
             ],
             label: Some("uniform_bind_group"),
         });
@@ -182,10 +185,14 @@ impl State {
         let i_time = [self.start.elapsed().as_secs_f32()];
         let i_resolution = [self.size.0 as f32, self.size.1 as f32, 1f32];
         let i_mouse = [0_f32 /* placeholder */; 4];
-        self.queue.write_buffer(&self.i_time_buffer, 0, bytes_of(&i_time));
-        self.queue.write_buffer(&self.i_resolution_buffer, 0, bytes_of(&i_resolution));
-        self.queue.write_buffer(&self.i_mouse_buffer, 0, bytes_of(&i_mouse));
-        self.queue.write_buffer(&self.i_frame_buffer, 0, bytes_of(&[self.frame_n]));
+        self.queue
+            .write_buffer(&self.i_time_buffer, 0, bytes_of(&i_time));
+        self.queue
+            .write_buffer(&self.i_resolution_buffer, 0, bytes_of(&i_resolution));
+        self.queue
+            .write_buffer(&self.i_mouse_buffer, 0, bytes_of(&i_mouse));
+        self.queue
+            .write_buffer(&self.i_frame_buffer, 0, bytes_of(&[self.frame_n]));
     }
 
     pub fn frame(
@@ -266,9 +273,9 @@ impl Fps {
 }
 
 pub fn parse_shadertoy_code(code: &str) -> anyhow::Result<ShaderSource> {
+    use naga::ShaderStage;
     use naga::back::wgsl::WriterFlags;
     use naga::front::glsl::Options;
-    use naga::ShaderStage;
     use naga::valid::{Capabilities, ValidationFlags, Validator};
 
     let template = include_str!("full_glsl.frag");
