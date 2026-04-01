@@ -5,8 +5,9 @@ use clap::Parser;
 use shadertoy_wgpu::{wgpu_things, Fps, RenderTargetInfo, State};
 use std::env;
 use std::fs::File;
-use std::io::Read;
+use std::io::{stdout, Read, Write};
 use std::path::PathBuf;
+use std::process::exit;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -104,7 +105,7 @@ impl ApplicationHandler for App {
                 if let Some(f) = &mut self.fps {
                     let (d, fps) = f.hint_and_get();
                     if d.as_secs_f64() > 1.0 {
-                        println!("FPS: {}", fps);
+                        eprintln!("FPS: {}", fps);
                         self.fps = Some(Fps::new());
                     }
                 } else {
@@ -167,10 +168,15 @@ fn render_offscreen(config: Config) -> anyhow::Result<()> {
     let mut state = pollster::block_on(state);
 
     loop {
-        println!("Offscreen frame: {}", state.frame_n);
-        let result = state.frame_offscreen();
-        let image = result?;
-        image.save(format!("/tmp/frames/{}.png", state.frame_n))?;
+        eprintln!("Offscreen frame: {}", state.frame_n);
+        let mut stdout = stdout();
+        let result = state.frame_offscreen(|image_buf| {
+            // output the raw buffer to stdout, allowing being piped to ffmpeg
+            // buffer format: bgra8888
+            stdout.write_all(image_buf).unwrap();
+        });
+        result?;
+        eprintln!("Offscreen frame: {}", state.frame_n);
     }
 
     Ok(())

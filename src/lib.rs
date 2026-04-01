@@ -1,5 +1,4 @@
 use bytemuck::bytes_of;
-use image::{ImageBuffer, Rgb};
 use std::time::{Duration, Instant};
 use wgpu::wgt::PollType;
 use wgpu::{
@@ -73,7 +72,7 @@ pub enum RenderTarget {
         stage_buffer: Buffer,
         size: (u32, u32),
         per_row_size_padded: u32,
-        output_image_buffer: Vec<image::Rgb<u8>>,
+        output_image_buffer: Vec<u8>,
     },
 }
 
@@ -136,8 +135,7 @@ impl State {
                     usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                let output_image_buffer =
-                    vec![image::Rgb(default!()); size.0 as usize * size.1 as usize];
+                let output_image_buffer = vec![0_u8; size.0 as usize * size.1 as usize * 4];
 
                 format = ofs_format;
                 target = RenderTarget::Offscreen {
@@ -295,7 +293,7 @@ impl State {
             .write_buffer(&self.i_frame_buffer, 0, bytes_of(&[self.frame_n]));
     }
 
-    pub fn frame_offscreen(&mut self) -> anyhow::Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+    pub fn frame_offscreen(&mut self, buffer_callback: impl FnOnce(&[u8])) -> anyhow::Result<()> {
         self.write_uniforms();
 
         let RenderTarget::Offscreen {
@@ -395,23 +393,15 @@ impl State {
         let mapped = stage_buffer.get_mapped_range(..);
         let gpu_buf = &*mapped;
         for row_n in 0..size.1 {
-            for x in 0..size.0 as usize {
-                let pix = &mut output_image_buffer[size.0 as usize * row_n as usize + x];
-                let start = (*per_row_size_padded * row_n) as usize + x * 4;
-                let b = gpu_buf[start];
-                let g = gpu_buf[start + 1];
-                let r = gpu_buf[start + 2];
-                let _a = gpu_buf[start + 3];
-                *pix = image::Rgb([r, g, b]);
-            }
+            let start = (*per_row_size_padded * row_n) as usize;
+            let out_buf_start = size.0 as usize * 4 * row_n as usize;
+            output_image_buffer[out_buf_start..(out_buf_start + size.0 as usize * 4)]
+                .copy_from_slice(&gpu_buf[start..(start + size.0 as usize * 4)]);
         }
+        buffer_callback(output_image_buffer);
         drop(mapped);
         stage_buffer.unmap();
-
-        let image = image::RgbImage::from_fn(size.0, size.1, |x, y| {
-            output_image_buffer[y as usize * size.0 as usize + x as usize]
-        });
-        Ok(image)
+        Ok(())
     }
 
     pub fn frame(
