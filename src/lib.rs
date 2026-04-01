@@ -55,7 +55,7 @@ impl State {
             width: self.size.0,
             height: self.size.1,
             desired_maximum_frame_latency: 2,
-            present_mode: wgpu::PresentMode::Immediate,
+            present_mode: wgpu::PresentMode::AutoVsync,
         };
         self.surface.configure(&self.device, &surface_config);
     }

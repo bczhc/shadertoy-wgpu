@@ -86,8 +86,9 @@ impl ApplicationHandler for App {
 
                 match state.frame(|| w.pre_present_notify()) {
                     Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                    Err(wgpu::SurfaceError::Lost) => state.configure_surface(),
                     Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                    Err(wgpu::SurfaceError::Outdated) => state.configure_surface(),
                     Err(e) => eprintln!("{:?}", e),
                 }
                 self.frame_counter += 1;
