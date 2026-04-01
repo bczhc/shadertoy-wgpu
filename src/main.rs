@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use wgpu::{Backends, Instance, InstanceDescriptor, InstanceFlags};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 use winit::{
@@ -20,6 +20,7 @@ use winit::{
 
 struct Config {
     code: String,
+    args: Args,
 }
 
 #[derive(Default)]
@@ -34,12 +35,17 @@ struct App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let config = self.config.as_ref().expect("Config is missing");
+
         // Create window object
         let window = Arc::new(
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_inner_size(LogicalSize::new(1024 / 2, 1024 / 2)),
+                        .with_resizable(!config.args.fixed_window)
+                        .with_inner_size(PhysicalSize::new(
+                            config.args.width,
+                            config.args.height,
+                        )),
                 )
                 .unwrap(),
         );
@@ -119,6 +125,15 @@ struct Args {
     /// Shadertoy fragment shader code
     #[arg(value_hint = clap::ValueHint::FilePath, default_value = "shadertoy.frag")]
     code: PathBuf,
+    /// Window width
+    #[arg(long, default_value = "1280")]
+    width: u32,
+    /// Window height
+    #[arg(long, default_value = "720")]
+    height: u32,
+    /// Whether to make the window unresizable.
+    #[arg(long, default_value = "false")]
+    fixed_window: bool,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -135,7 +150,7 @@ pub fn main() -> anyhow::Result<()> {
         ));
     }
     let mut shadertoy_code = String::new();
-    File::open(args.code)?.read_to_string(&mut shadertoy_code)?;
+    File::open(&args.code)?.read_to_string(&mut shadertoy_code)?;
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -143,6 +158,7 @@ pub fn main() -> anyhow::Result<()> {
     let mut app = App::default();
     app.config = Some(Config {
         code: shadertoy_code,
+        args,
     });
     event_loop.run_app(&mut app)?;
 
