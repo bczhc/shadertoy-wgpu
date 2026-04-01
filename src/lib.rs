@@ -87,7 +87,7 @@ impl State {
             label: None,
             source: parse_shadertoy_code(&shadertoy_code).unwrap(),
         });
-        let shader_vs = device.create_shader_module(include_wgsl!("full_quad.wgsl"));
+        let shader_vs = device.create_shader_module(include_wgsl!("quad.wgsl"));
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
