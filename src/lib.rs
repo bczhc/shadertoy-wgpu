@@ -1,9 +1,13 @@
-use bytemuck::{bytes_of, Pod, Zeroable};
+use bytemuck::bytes_of;
+use image::{ImageBuffer, Rgb};
 use std::time::{Duration, Instant};
+use wgpu::wgt::PollType;
 use wgpu::{
-    include_wgsl, Buffer, BufferDescriptor, BufferUsages, Device, Instance,
-    LoadOpDontCare, PipelineCompilationOptions, ShaderModuleDescriptor, ShaderSource, Surface,
-    TextureFormat,
+    include_wgsl, Adapter, Backends, Buffer, BufferDescriptor, BufferUsages, Device, Extent3d,
+    Instance, InstanceDescriptor, InstanceFlags, LoadOpDontCare, MapMode, PipelineCompilationOptions,
+    Queue, ShaderModuleDescriptor, ShaderSource, Surface, TexelCopyBufferInfo,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
 };
 
 macro_rules! default {
@@ -12,24 +16,8 @@ macro_rules! default {
     };
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct Uniforms {
-    origin: [f32; 3],
-    padding1: f32,
-    right: [f32; 3],
-    padding2: f32,
-    up: [f32; 3],
-    padding3: f32,
-    forward: [f32; 3],
-    padding4: f32,
-    screen_size: [f32; 2],
-    len: f32,
-    padding5: f32,
-}
-
 pub struct State {
-    surface: Surface<'static>,
+    target: RenderTarget,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub size: (u32, u32),
@@ -37,7 +25,7 @@ pub struct State {
     uniform_bind_group: wgpu::BindGroup,
     texture_format: wgpu::TextureFormat,
     start: Instant,
-    frame_n: u32,
+    pub frame_n: u32,
     /* --- input uniforms --- */
     i_time_buffer: Buffer,
     i_resolution_buffer: Buffer,
@@ -45,8 +33,61 @@ pub struct State {
     i_frame_buffer: Buffer,
 }
 
+pub fn wgpu_instance_from_envs() -> Instance {
+    Instance::new(&InstanceDescriptor {
+        backends: Backends::from_env().unwrap_or_default(),
+        flags: InstanceFlags::from_env_or_default(),
+        memory_budget_thresholds: Default::default(),
+        backend_options: Default::default(),
+    })
+}
+
+pub fn wgpu_things() -> (Instance, Device, Queue, Adapter) {
+    let instance = wgpu_instance_from_envs();
+    let adapter = pollster::block_on(instance.request_adapter(&default!())).unwrap();
+
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+    (instance, device, queue, adapter)
+}
+
+fn pick_texture_format(surface: &Surface, adapter: &Adapter) -> TextureFormat {
+    let surface_caps = surface.get_capabilities(adapter);
+
+    // Do not use srgb suffix. This makes wgpu think all colors we give are already in a
+    // non-linear sRGB space and do not do an automatic gamma correction.
+    let mut texture_format = TextureFormat::Bgra8Unorm;
+    if !surface_caps.formats.iter().any(|x| x == &texture_format) {
+        texture_format = surface_caps.formats[0].remove_srgb_suffix();
+    }
+    texture_format
+}
+
+pub enum RenderTarget {
+    Null,
+    Surface(Surface<'static>),
+    Offscreen {
+        texture: Texture,
+        view: TextureView,
+        framerate: u32,
+        stage_buffer: Buffer,
+        size: (u32, u32),
+        per_row_size_padded: u32,
+        output_image_buffer: Vec<image::Rgb<u8>>,
+    },
+}
+
+pub enum RenderTargetInfo {
+    Offscreen { framerate: u32, size: (u32, u32) },
+    Surface(Surface<'static>),
+}
+
 impl State {
     pub fn configure_surface(&self) {
+        let RenderTarget::Surface(surface) = &self.target else {
+            return;
+        };
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: self.texture_format,
@@ -57,31 +98,17 @@ impl State {
             desired_maximum_frame_latency: 2,
             present_mode: wgpu::PresentMode::AutoVsync,
         };
-        self.surface.configure(&self.device, &surface_config);
+        surface.configure(&self.device, &surface_config);
     }
 
     pub async fn new(
-        instance: Instance,
-        surface: Surface<'static>,
+        device: Device,
+        queue: Queue,
+        adapter: Adapter,
         size: (u32, u32),
         code: &str,
+        target_info: RenderTargetInfo,
     ) -> Self {
-        let adapter = instance.request_adapter(&default!()).await.unwrap();
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .unwrap();
-
-        let surface_caps = surface.get_capabilities(&adapter);
-
-        // Do not use srgb suffix. This makes wgpu think all colors we give are already in a
-        // non-linear sRGB space and do not do an automatic gamma correction.
-        let mut texture_format = TextureFormat::Bgra8Unorm;
-        if !surface_caps.formats.iter().any(|x| x == &texture_format) {
-            texture_format = surface_caps.formats[0].remove_srgb_suffix();
-        }
-
         let shadertoy_code = code;
         let shader_fs = device.create_shader_module(ShaderModuleDescriptor {
             label: None,
@@ -89,7 +116,47 @@ impl State {
         });
         let shader_vs = device.create_shader_module(include_wgsl!("quad.wgsl"));
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let format;
+        let target;
+        match target_info {
+            RenderTargetInfo::Offscreen { framerate, size } => {
+                // do not do gamma correction
+                let ofs_format = TextureFormat::Bgra8Unorm;
+                let texture = Self::create_offscreen_texture(&device, size, ofs_format);
+                let view = texture.create_view(&TextureViewDescriptor {
+                    format: None,
+                    ..default!()
+                });
+                let per_row_size = size.0 * 4;
+                let per_row_size_padded = ((per_row_size + 256 - 1) / 256) * 256;
+                let rows = size.1;
+                let stage_buffer = device.create_buffer(&BufferDescriptor {
+                    label: None,
+                    size: (per_row_size_padded * rows) as _,
+                    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let output_image_buffer =
+                    vec![image::Rgb(default!()); size.0 as usize * size.1 as usize];
+
+                format = ofs_format;
+                target = RenderTarget::Offscreen {
+                    framerate,
+                    texture,
+                    view,
+                    stage_buffer,
+                    size,
+                    per_row_size_padded,
+                    output_image_buffer,
+                }
+            }
+            RenderTargetInfo::Surface(s) => {
+                format = pick_texture_format(&s, &adapter);
+                target = RenderTarget::Surface(s);
+            }
+        }
+
+        let render_pipeline_desc = &mut wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: None,
             vertex: wgpu::VertexState {
@@ -106,7 +173,7 @@ impl State {
                     constants: &[],
                 },
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: texture_format,
+                    format,
                     blend: None,
                     write_mask: Default::default(),
                 })],
@@ -116,7 +183,8 @@ impl State {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             cache: None,
-        });
+        };
+        let pipeline = device.create_render_pipeline(render_pipeline_desc);
 
         let i_time_buffer = Self::create_uniform_buffer(&device, 4);
         let i_resolution_buffer = Self::create_uniform_buffer(&device, 12);
@@ -147,13 +215,13 @@ impl State {
         });
 
         let state = Self {
-            surface,
+            target,
             device,
             queue,
             size,
             pipeline,
             uniform_bind_group,
-            texture_format,
+            texture_format: format,
             start: Instant::now(),
             frame_n: 0,
             i_time_buffer,
@@ -162,7 +230,30 @@ impl State {
             i_frame_buffer,
         };
         state.configure_surface();
+
         state
+    }
+
+    fn create_offscreen_texture(
+        device: &Device,
+        size: (u32, u32),
+        format: TextureFormat,
+    ) -> Texture {
+        let ofs_texture = device.create_texture(&TextureDescriptor {
+            size: Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            label: None,
+            dimension: TextureDimension::D2,
+            format,
+            usage: TextureUsages::COPY_SRC | TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+            sample_count: 1,
+        });
+        ofs_texture
     }
 
     fn create_uniform_buffer(device: &Device, size: u64) -> Buffer {
@@ -182,7 +273,16 @@ impl State {
     }
 
     fn write_uniforms(&self) {
-        let i_time = [self.start.elapsed().as_secs_f32()];
+        let i_time;
+        match self.target {
+            RenderTarget::Surface(_) | RenderTarget::Null => {
+                i_time = [self.start.elapsed().as_secs_f32()];
+            }
+            RenderTarget::Offscreen { framerate, .. } => {
+                i_time = [(self.frame_n as f64 / framerate as f64) as f32];
+            }
+        }
+
         let i_resolution = [self.size.0 as f32, self.size.1 as f32, 1f32];
         let i_mouse = [0_f32 /* placeholder */; 4];
         self.queue
@@ -195,13 +295,136 @@ impl State {
             .write_buffer(&self.i_frame_buffer, 0, bytes_of(&[self.frame_n]));
     }
 
+    pub fn frame_offscreen(&mut self) -> anyhow::Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+        self.write_uniforms();
+
+        let RenderTarget::Offscreen {
+            texture,
+            stage_buffer,
+            per_row_size_padded,
+            size,
+            output_image_buffer,
+            ..
+        } = &mut self.target
+        else {
+            return Err(anyhow::anyhow!("Offscreen render target not set up"));
+        };
+
+        let view = texture.create_view(&TextureViewDescriptor { ..default!() });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::DontCare(LoadOpDontCare::default()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            pass.draw(0..6, 0..1);
+        }
+
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: Default::default(),
+            },
+            TexelCopyBufferInfo {
+                buffer: stage_buffer,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(*per_row_size_padded),
+                    rows_per_image: Some(size.1),
+                },
+            },
+            Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let command_buffer = encoder.finish();
+
+        self.queue.submit([command_buffer]);
+
+        self.frame_n += 1;
+
+        loop {
+            if self
+                .device
+                .poll(PollType::Wait {
+                    timeout: None,
+                    submission_index: None,
+                })?
+                .wait_finished()
+            {
+                break;
+            }
+        }
+
+        let channel = oneshot::channel();
+        stage_buffer.map_async(MapMode::Read, .., move |r| {
+            channel.0.send(r).unwrap();
+        });
+        self.device.poll(PollType::Wait {
+            timeout: None,
+            submission_index: None,
+        })?;
+        channel.1.recv()??;
+
+        let mapped = stage_buffer.get_mapped_range(..);
+        let gpu_buf = &*mapped;
+        for row_n in 0..size.1 {
+            for x in 0..size.0 as usize {
+                let pix = &mut output_image_buffer[size.0 as usize * row_n as usize + x];
+                let start = (*per_row_size_padded * row_n) as usize + x * 4;
+                let b = gpu_buf[start];
+                let g = gpu_buf[start + 1];
+                let r = gpu_buf[start + 2];
+                let _a = gpu_buf[start + 3];
+                *pix = image::Rgb([r, g, b]);
+            }
+        }
+        drop(mapped);
+        stage_buffer.unmap();
+
+        let image = image::RgbImage::from_fn(size.0, size.1, |x, y| {
+            output_image_buffer[y as usize * size.0 as usize + x as usize]
+        });
+        Ok(image)
+    }
+
     pub fn frame(
         &mut self,
         before_submit_callback: impl FnOnce(),
     ) -> Result<(), wgpu::SurfaceError> {
         self.write_uniforms();
 
-        let surface_texture = self.surface.get_current_texture()?;
+        let RenderTarget::Surface(surface) = &self.target else {
+            return Ok(());
+        };
+
+        let surface_texture = surface.get_current_texture()?;
 
         let texture_view = surface_texture
             .texture

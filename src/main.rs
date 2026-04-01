@@ -2,13 +2,12 @@
 
 use anyhow::anyhow;
 use clap::Parser;
-use shadertoy_wgpu::{Fps, State};
+use shadertoy_wgpu::{wgpu_things, Fps, RenderTargetInfo, State};
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
-use wgpu::{Backends, Instance, InstanceDescriptor, InstanceFlags};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
@@ -20,7 +19,7 @@ use winit::{
 
 struct Config {
     code: String,
-    args: Args,
+    args: Arc<Args>,
 }
 
 #[derive(Default)]
@@ -42,10 +41,7 @@ impl ApplicationHandler for App {
                 .create_window(
                     Window::default_attributes()
                         .with_resizable(!config.args.fixed_window)
-                        .with_inner_size(PhysicalSize::new(
-                            config.args.width,
-                            config.args.height,
-                        )),
+                        .with_inner_size(PhysicalSize::new(config.args.width, config.args.height)),
                 )
                 .unwrap(),
         );
@@ -54,15 +50,17 @@ impl ApplicationHandler for App {
             let result: anyhow::Result<()> = try {
                 let size = window.inner_size();
                 // let size = (1024, 1024);
-                let instance = Instance::new(&InstanceDescriptor {
-                    backends: Backends::from_env().unwrap_or_default(),
-                    flags: InstanceFlags::from_env_or_default(),
-                    memory_budget_thresholds: Default::default(),
-                    backend_options: Default::default(),
-                });
+                let (instance, device, queue, adapter) = wgpu_things();
                 let surface = instance.create_surface(Arc::clone(&window))?;
-                let state =
-                    State::new(instance, surface, (size.width, size.height), &config.code).await;
+                let state = State::new(
+                    device,
+                    queue,
+                    adapter,
+                    (size.width, size.height),
+                    &config.code,
+                    RenderTargetInfo::Surface(surface),
+                )
+                .await;
                 self.state = Some(state);
             };
             result
@@ -134,6 +132,48 @@ struct Args {
     /// Whether to make the window unresizable.
     #[arg(long, default_value = "false")]
     fixed_window: bool,
+    /// Framerate. This will affect how `iTime` is calculated. Only use along with `offscreen`.
+    #[arg(short, long)]
+    framerate: Option<u32>,
+    /// Offscreen rendering mode, producing png stream.
+    #[arg(short, long)]
+    offscreen: bool,
+}
+
+fn start_window(config: Config) -> anyhow::Result<()> {
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let mut app = App::default();
+    app.config = Some(config);
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+fn render_offscreen(config: Config) -> anyhow::Result<()> {
+    let (instance, device, queue, adapter) = wgpu_things();
+
+    let state = State::new(
+        device,
+        queue,
+        adapter,
+        (config.args.width, config.args.height),
+        &config.code,
+        RenderTargetInfo::Offscreen {
+            framerate: config.args.framerate.unwrap_or(0),
+            size: (config.args.width, config.args.height),
+        },
+    );
+    let mut state = pollster::block_on(state);
+
+    loop {
+        println!("Offscreen frame: {}", state.frame_n);
+        let result = state.frame_offscreen();
+        let image = result?;
+        image.save(format!("/tmp/frames/{}.png", state.frame_n))?;
+    }
+
+    Ok(())
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -142,7 +182,7 @@ pub fn main() -> anyhow::Result<()> {
     }
     env_logger::init();
 
-    let args = Args::parse();
+    let args = Arc::new(Args::parse());
     if !args.code.exists() {
         return Err(anyhow!(
             "Shadertoy shader file '{}' does not exist.",
@@ -151,16 +191,16 @@ pub fn main() -> anyhow::Result<()> {
     }
     let mut shadertoy_code = String::new();
     File::open(&args.code)?.read_to_string(&mut shadertoy_code)?;
-
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Wait);
-
-    let mut app = App::default();
-    app.config = Some(Config {
+    let config = Config {
         code: shadertoy_code,
-        args,
-    });
-    event_loop.run_app(&mut app)?;
+        args: Arc::clone(&args),
+    };
+
+    if !args.offscreen {
+        start_window(config)?;
+    } else {
+        render_offscreen(config)?;
+    }
 
     Ok(())
 }
